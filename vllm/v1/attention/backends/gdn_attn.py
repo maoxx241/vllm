@@ -33,6 +33,89 @@ class GDNAttentionBackend(AttentionBackend):
 
 
 @dataclass
+class GDNChunkedPrefillMetadata:
+    chunk_indices_64: torch.Tensor
+    chunk_offsets_64: torch.Tensor
+    update_chunk_offsets_64: torch.Tensor
+    final_chunk_indices_64: torch.Tensor
+    chunk_indices_large_block: torch.Tensor
+    block_indices_cumsum: torch.Tensor
+    _buffer_slot: object | None = None
+
+
+@dataclass
+class _GDNChunkedPrefillBufferSlot:
+    chunk_indices_64_cpu: torch.Tensor
+    chunk_indices_64_device: torch.Tensor
+    chunk_offsets_64_cpu: torch.Tensor
+    chunk_offsets_64_device: torch.Tensor
+    update_chunk_offsets_64_cpu: torch.Tensor
+    update_chunk_offsets_64_device: torch.Tensor
+    final_chunk_indices_64_cpu: torch.Tensor
+    final_chunk_indices_64_device: torch.Tensor
+    chunk_indices_large_block_cpu: torch.Tensor
+    chunk_indices_large_block_device: torch.Tensor
+    block_indices_cumsum_cpu: torch.Tensor
+    block_indices_cumsum_device: torch.Tensor
+
+
+def _next_power_of_2(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
+def _prepare_chunk_counts_cpu(
+    cu_seqlens_cpu: torch.Tensor, chunk_size: int
+) -> torch.Tensor:
+    lens = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
+    return torch.div(lens + chunk_size - 1, chunk_size, rounding_mode="floor")
+
+
+def _fill_chunk_indices_cpu(
+    out: torch.Tensor, chunk_counts: torch.Tensor
+) -> int:
+    cursor = 0
+    for seq_idx, num_chunks in enumerate(chunk_counts.tolist()):
+        if num_chunks <= 0:
+            continue
+        out[cursor : cursor + num_chunks, 0].fill_(seq_idx)
+        out[cursor : cursor + num_chunks, 1] = torch.arange(
+            num_chunks,
+            dtype=out.dtype,
+        )
+        cursor += num_chunks
+    return cursor
+
+
+def _fill_chunk_offsets_cpu(out: torch.Tensor, chunk_counts: torch.Tensor) -> int:
+    out[0] = 0
+    if chunk_counts.numel() > 0:
+        torch.cumsum(chunk_counts, dim=0, out=out[1 : chunk_counts.numel() + 1])
+    return chunk_counts.numel() + 1
+
+
+def _fill_update_chunk_offsets_cpu(
+    out: torch.Tensor, chunk_counts: torch.Tensor
+) -> int:
+    out[0] = 0
+    if chunk_counts.numel() > 0:
+        torch.cumsum(
+            chunk_counts + 1,
+            dim=0,
+            out=out[1 : chunk_counts.numel() + 1],
+        )
+    return chunk_counts.numel() + 1
+
+
+def _fill_final_chunk_indices_cpu(out: torch.Tensor, chunk_counts: torch.Tensor) -> int:
+    if chunk_counts.numel() > 0:
+        torch.cumsum(chunk_counts + 1, dim=0, out=out[: chunk_counts.numel()])
+        out[: chunk_counts.numel()].sub_(1)
+    return chunk_counts.numel()
+
+
+@dataclass
 class GDNAttentionMetadata:
     num_prefills: int
     num_prefill_tokens: int
@@ -63,6 +146,7 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+    non_spec_chunked_prefill_meta: GDNChunkedPrefillMetadata | None = None
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -82,6 +166,27 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.compilation_config = vllm_config.compilation_config
         self.speculative_config = vllm_config.speculative_config
         self.kv_cache_spec = kv_cache_spec
+        self.device = device
+        self.max_num_batched_tokens = (
+            self.vllm_config.scheduler_config.max_num_batched_tokens
+        )
+        self.max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        self.chunk_size = 64
+        self.large_block_size = 608 * 2
+        hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
+        if hf_text_config is not None and hasattr(hf_text_config, "linear_num_value_heads"):
+            self.gdn_num_heads = (
+                hf_text_config.linear_num_value_heads
+                // self.vllm_config.parallel_config.tensor_parallel_size
+            )
+        else:
+            self.gdn_num_heads = self.vllm_config.model_config.get_num_attention_heads(
+                self.vllm_config.parallel_config
+            )
+        cumsum_chunks = max(1, (2**18) // (self.gdn_num_heads * self.chunk_size))
+        self.cumsum_block_size = _next_power_of_2(cumsum_chunks)
+        self._chunked_prefill_pool: list[_GDNChunkedPrefillBufferSlot] = []
+        self._chunked_prefill_pool_idx = -1
 
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
@@ -143,6 +248,185 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             (self.decode_cudagraph_max_bs,),
             dtype=torch.int32,
             device=device,
+        )
+
+        if device.type != "cpu":
+            # Two slots are enough for async scheduling overlap: one batch can
+            # execute on device while the next batch is prepared on CPU/H2D.
+            self._chunked_prefill_pool = [
+                self._allocate_chunked_prefill_slot(device),
+                self._allocate_chunked_prefill_slot(device),
+            ]
+
+    def _allocate_chunked_prefill_slot(
+        self, device: torch.device
+    ) -> _GDNChunkedPrefillBufferSlot:
+        cpu_kwargs = {
+            "dtype": torch.int32,
+            "device": "cpu",
+            "pin_memory": True,
+        }
+        device_kwargs = {
+            "dtype": torch.int32,
+            "device": device,
+        }
+        return _GDNChunkedPrefillBufferSlot(
+            chunk_indices_64_cpu=torch.empty(
+                (self.max_num_batched_tokens, 2), **cpu_kwargs
+            ),
+            chunk_indices_64_device=torch.empty(
+                (self.max_num_batched_tokens, 2), **device_kwargs
+            ),
+            chunk_offsets_64_cpu=torch.empty((self.max_num_seqs + 1,), **cpu_kwargs),
+            chunk_offsets_64_device=torch.empty(
+                (self.max_num_seqs + 1,), **device_kwargs
+            ),
+            update_chunk_offsets_64_cpu=torch.empty(
+                (self.max_num_seqs + 1,), **cpu_kwargs
+            ),
+            update_chunk_offsets_64_device=torch.empty(
+                (self.max_num_seqs + 1,), **device_kwargs
+            ),
+            final_chunk_indices_64_cpu=torch.empty((self.max_num_seqs,), **cpu_kwargs),
+            final_chunk_indices_64_device=torch.empty(
+                (self.max_num_seqs,), **device_kwargs
+            ),
+            chunk_indices_large_block_cpu=torch.empty(
+                (self.max_num_batched_tokens, 2), **cpu_kwargs
+            ),
+            chunk_indices_large_block_device=torch.empty(
+                (self.max_num_batched_tokens, 2), **device_kwargs
+            ),
+            block_indices_cumsum_cpu=torch.empty(
+                (self.max_num_batched_tokens, 2), **cpu_kwargs
+            ),
+            block_indices_cumsum_device=torch.empty(
+                (self.max_num_batched_tokens, 2), **device_kwargs
+            ),
+        )
+
+    def _build_non_spec_chunked_prefill_meta_cpu(
+        self, cu_seqlens_cpu: torch.Tensor
+    ) -> GDNChunkedPrefillMetadata:
+        chunk_counts_64 = _prepare_chunk_counts_cpu(cu_seqlens_cpu, self.chunk_size)
+        chunk_counts_large = _prepare_chunk_counts_cpu(
+            cu_seqlens_cpu, self.large_block_size
+        )
+        chunk_counts_cumsum = _prepare_chunk_counts_cpu(
+            cu_seqlens_cpu, self.cumsum_block_size
+        )
+        num_seqs = chunk_counts_64.numel()
+        chunk_indices_64 = torch.empty(
+            (int(chunk_counts_64.sum().item()), 2), dtype=torch.int32
+        )
+        chunk_offsets_64 = torch.empty((num_seqs + 1,), dtype=torch.int32)
+        update_chunk_offsets_64 = torch.empty((num_seqs + 1,), dtype=torch.int32)
+        final_chunk_indices_64 = torch.empty((num_seqs,), dtype=torch.int32)
+        chunk_indices_large_block = torch.empty(
+            (int(chunk_counts_large.sum().item()), 2), dtype=torch.int32
+        )
+        block_indices_cumsum = torch.empty(
+            (int(chunk_counts_cumsum.sum().item()), 2), dtype=torch.int32
+        )
+
+        _fill_chunk_indices_cpu(chunk_indices_64, chunk_counts_64)
+        _fill_chunk_offsets_cpu(chunk_offsets_64, chunk_counts_64)
+        _fill_update_chunk_offsets_cpu(update_chunk_offsets_64, chunk_counts_64)
+        _fill_final_chunk_indices_cpu(final_chunk_indices_64, chunk_counts_64)
+        _fill_chunk_indices_cpu(chunk_indices_large_block, chunk_counts_large)
+        _fill_chunk_indices_cpu(block_indices_cumsum, chunk_counts_cumsum)
+
+        return GDNChunkedPrefillMetadata(
+            chunk_indices_64=chunk_indices_64.to(self.device),
+            chunk_offsets_64=chunk_offsets_64.to(self.device),
+            update_chunk_offsets_64=update_chunk_offsets_64.to(self.device),
+            final_chunk_indices_64=final_chunk_indices_64.to(self.device),
+            chunk_indices_large_block=chunk_indices_large_block.to(self.device),
+            block_indices_cumsum=block_indices_cumsum.to(self.device),
+        )
+
+    def _build_non_spec_chunked_prefill_meta(
+        self, cu_seqlens_cpu: torch.Tensor
+    ) -> GDNChunkedPrefillMetadata:
+        if self.device.type == "cpu":
+            return self._build_non_spec_chunked_prefill_meta_cpu(cu_seqlens_cpu)
+
+        self._chunked_prefill_pool_idx = (
+            self._chunked_prefill_pool_idx + 1
+        ) % len(self._chunked_prefill_pool)
+        slot = self._chunked_prefill_pool[self._chunked_prefill_pool_idx]
+        chunk_counts_64 = _prepare_chunk_counts_cpu(cu_seqlens_cpu, self.chunk_size)
+        chunk_counts_large = _prepare_chunk_counts_cpu(
+            cu_seqlens_cpu, self.large_block_size
+        )
+        chunk_counts_cumsum = _prepare_chunk_counts_cpu(
+            cu_seqlens_cpu, self.cumsum_block_size
+        )
+        num_chunk_indices_64 = _fill_chunk_indices_cpu(
+            slot.chunk_indices_64_cpu, chunk_counts_64
+        )
+        num_chunk_offsets_64 = _fill_chunk_offsets_cpu(
+            slot.chunk_offsets_64_cpu, chunk_counts_64
+        )
+        num_update_chunk_offsets_64 = _fill_update_chunk_offsets_cpu(
+            slot.update_chunk_offsets_64_cpu, chunk_counts_64
+        )
+        num_final_chunk_indices_64 = _fill_final_chunk_indices_cpu(
+            slot.final_chunk_indices_64_cpu, chunk_counts_64
+        )
+        num_chunk_indices_large = _fill_chunk_indices_cpu(
+            slot.chunk_indices_large_block_cpu, chunk_counts_large
+        )
+        num_block_indices_cumsum = _fill_chunk_indices_cpu(
+            slot.block_indices_cumsum_cpu, chunk_counts_cumsum
+        )
+
+        chunk_indices_64 = slot.chunk_indices_64_device[:num_chunk_indices_64]
+        chunk_indices_64.copy_(
+            slot.chunk_indices_64_cpu[:num_chunk_indices_64],
+            non_blocking=True,
+        )
+        chunk_offsets_64 = slot.chunk_offsets_64_device[:num_chunk_offsets_64]
+        chunk_offsets_64.copy_(
+            slot.chunk_offsets_64_cpu[:num_chunk_offsets_64],
+            non_blocking=True,
+        )
+        update_chunk_offsets_64 = slot.update_chunk_offsets_64_device[
+            :num_update_chunk_offsets_64
+        ]
+        update_chunk_offsets_64.copy_(
+            slot.update_chunk_offsets_64_cpu[:num_update_chunk_offsets_64],
+            non_blocking=True,
+        )
+        final_chunk_indices_64 = slot.final_chunk_indices_64_device[
+            :num_final_chunk_indices_64
+        ]
+        final_chunk_indices_64.copy_(
+            slot.final_chunk_indices_64_cpu[:num_final_chunk_indices_64],
+            non_blocking=True,
+        )
+        chunk_indices_large_block = slot.chunk_indices_large_block_device[
+            :num_chunk_indices_large
+        ]
+        chunk_indices_large_block.copy_(
+            slot.chunk_indices_large_block_cpu[:num_chunk_indices_large],
+            non_blocking=True,
+        )
+        block_indices_cumsum = slot.block_indices_cumsum_device[
+            :num_block_indices_cumsum
+        ]
+        block_indices_cumsum.copy_(
+            slot.block_indices_cumsum_cpu[:num_block_indices_cumsum],
+            non_blocking=True,
+        )
+        return GDNChunkedPrefillMetadata(
+            chunk_indices_64=chunk_indices_64,
+            chunk_offsets_64=chunk_offsets_64,
+            update_chunk_offsets_64=update_chunk_offsets_64,
+            final_chunk_indices_64=final_chunk_indices_64,
+            chunk_indices_large_block=chunk_indices_large_block,
+            block_indices_cumsum=block_indices_cumsum,
+            _buffer_slot=slot,
         )
 
     def build(  # type: ignore[override]
@@ -305,6 +589,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             has_initial_state = None
 
+        non_spec_chunked_prefill_meta = None
+        if num_prefills > 0:
+            assert non_spec_query_start_loc_cpu is not None
+            non_spec_chunked_prefill_meta = (
+                self._build_non_spec_chunked_prefill_meta(non_spec_query_start_loc_cpu)
+            )
+
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
         assert not (num_decodes > 0 and num_spec_decodes > 0), (
@@ -401,6 +692,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            non_spec_chunked_prefill_meta=non_spec_chunked_prefill_meta,
         )
         return attn_metadata
 
