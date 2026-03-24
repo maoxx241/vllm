@@ -16,6 +16,38 @@ from vllm.platforms import current_platform
 from .mem_constants import GiB_bytes, MiB_bytes
 
 
+def _use_torch_npu_api(device: torch.types.Device) -> bool:
+    return getattr(device, "type", None) == "npu" and hasattr(torch, "npu")
+
+
+def _reset_peak_memory_stats(device: torch.types.Device) -> None:
+    if _use_torch_npu_api(device):
+        torch.npu.reset_peak_memory_stats(device)
+        return
+    torch.accelerator.reset_peak_memory_stats(device)
+
+
+def _empty_cache(device: torch.types.Device) -> None:
+    if _use_torch_npu_api(device):
+        torch.npu.empty_cache()
+        return
+    torch.accelerator.empty_cache()
+
+
+def _torch_peak_memory(device: torch.types.Device) -> int:
+    if _use_torch_npu_api(device):
+        return torch.npu.max_memory_allocated(device)
+    return torch.accelerator.memory_stats(device).get(
+        "allocated_bytes.all.peak", 0
+    )
+
+
+def _torch_reserved_memory(device: torch.types.Device) -> int:
+    if _use_torch_npu_api(device):
+        return torch.npu.memory_reserved(device)
+    return torch.accelerator.memory_reserved(device)
+
+
 def format_mib(b: int) -> str:
     return f"{round(b / MiB_bytes, 2)}"
 
@@ -97,9 +129,7 @@ class MemorySnapshot:
         # After `torch.accelerator.reset_peak_memory_stats()`,
         # `torch.accelerator.memory_reserved()` will keep growing, and only shrink
         # when we call `torch.accelerator.empty_cache()` or OOM happens.
-        self.torch_peak = torch.accelerator.memory_stats(device).get(
-            "allocated_bytes.all.peak", 0
-        )
+        self.torch_peak = _torch_peak_memory(device)
 
         self.free_memory, self.total_memory = current_platform.mem_get_info(device)
         shared_sysmem_device_mem_sms = ((8, 7), (11, 0), (12, 1))  # Orin, Thor, Spark
@@ -126,7 +156,7 @@ class MemorySnapshot:
         # torch.accelerator.memory_reserved() is how many bytes
         # PyTorch gets from cuda (by calling cudaMalloc, etc.)
         # this is used to measure the non-torch memory usage
-        self.torch_memory = torch.accelerator.memory_reserved(device)
+        self.torch_memory = _torch_reserved_memory(device)
 
         self.non_torch_memory = self.cuda_memory - self.torch_memory
         self.timestamp = time.time()
@@ -250,8 +280,8 @@ def memory_profiling(
     until after profiling to get (c.).
     """
     gc.collect()
-    torch.accelerator.empty_cache()
-    torch.accelerator.reset_peak_memory_stats(baseline_snapshot.device_)
+    _empty_cache(baseline_snapshot.device_)
+    _reset_peak_memory_stats(baseline_snapshot.device_)
 
     result = MemoryProfilingResult(
         before_create=baseline_snapshot,
@@ -264,7 +294,7 @@ def memory_profiling(
     yield result
 
     gc.collect()
-    torch.accelerator.empty_cache()
+    _empty_cache(baseline_snapshot.device_)
 
     result.after_profile.measure()
 
