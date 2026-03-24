@@ -493,6 +493,12 @@ def init_gloo_process_group(
         backend_class._set_sequence_number_for_group()
 
         pg._register_backend(device, backend_type, backend_class)
+        logger.info_once(
+            "init_gloo_process_group: world_size=%d group_rank=%d group=%s",
+            group_size,
+            group_rank,
+            pg.group_name,
+        )
     return pg
 
 
@@ -559,6 +565,7 @@ def stateless_init_torch_distributed_process_group(
             group_size=group_size,
             timeout=timeout,
         )
+        backend_name = "gloo"
     else:
         from vllm.platforms import current_platform
 
@@ -569,12 +576,23 @@ def stateless_init_torch_distributed_process_group(
             group_size=group_size,
             timeout=timeout,
         )
+        backend_name = str(backend)
 
     if group_name is not None:
         from torch._C._distributed_c10d import _register_process_group
 
         pg._set_group_name(group_name)
         _register_process_group(group_name, pg)
+    logger.info_once(
+        "stateless_init_torch_distributed_process_group: backend=%s group_name=%s host=%s:%s "
+        "world_size=%d group_rank=%d",
+        backend_name,
+        group_name,
+        host,
+        port,
+        world_size,
+        group_rank,
+    )
 
     if return_store:
         return pg, store

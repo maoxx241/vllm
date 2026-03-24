@@ -333,6 +333,12 @@ class GroupCoordinator:
         self_cpu_group = None
 
         for ranks in group_ranks:
+            logger.debug(
+                "GroupCoordinator init: name=%s backend=%s ranks=%s", 
+                group_name,
+                torch_distributed_backend,
+                ranks,
+            )
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
             )
@@ -393,6 +399,13 @@ class GroupCoordinator:
 
         self.use_cpu_custom_send_recv = current_platform.is_cpu() and hasattr(
             torch.ops._C, "init_shm_manager"
+        )
+        logger.info_once(
+            "parallel group initialized: %s (ranks=%s world_size=%d rank_in_group=%d backend=%s)",
+            self.unique_name,
+            self.ranks,
+            self.world_size,
+            torch.distributed.get_backend(self.device_group),
         )
 
     def create_mq_broadcaster(
@@ -1134,6 +1147,7 @@ def get_inner_dp_world_group() -> GroupCoordinator:
 def init_world_group(
     ranks: list[int], local_rank: int, backend: str
 ) -> GroupCoordinator:
+    logger.info_once("init_world_group: ranks=%s local_rank=%d backend=%s", ranks, local_rank, backend)
     return GroupCoordinator(
         group_ranks=[ranks],
         local_rank=local_rank,
@@ -1151,6 +1165,14 @@ def init_model_parallel_group(
     group_name: str | None = None,
     use_device_communicator: bool = True,
 ) -> GroupCoordinator:
+    logger.debug(
+        "init_model_parallel_group: name=%s ranksets=%s local_rank=%d backend=%s use_device_communicator=%s",
+        group_name,
+        group_ranks,
+        local_rank,
+        backend,
+        use_device_communicator,
+    )
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1421,9 +1443,22 @@ def init_distributed_environment(
             rank=rank,
             timeout=timeout,
         )
+        logger.info_once(
+            "init_process_group done: backend=%s method=%s world_size=%d rank=%d timeout=%s",
+            backend,
+            distributed_init_method,
+            world_size,
+            rank,
+            timeout,
+        )
         if enable_elastic_ep:
             tp_pp_cpu_group = torch.distributed.new_group(
                 backend="gloo", timeout=timeout
+            )
+            logger.info_once(
+                "elastic_ep tp_pp_cpu_group created: world_size=%s backend=%s",
+                torch.distributed.get_world_size(tp_pp_cpu_group),
+                torch.distributed.get_backend(tp_pp_cpu_group),
             )
             if _node_count(tp_pp_cpu_group) > 1:
                 # NOTE(yongji): StatelessGroupCoordinator uses data_parallel_master_ip
