@@ -26,7 +26,6 @@ If you only need to use the distributed environment without model/pipeline
 import contextlib
 import gc
 import pickle
-import os
 import weakref
 from collections import namedtuple
 from collections.abc import Callable
@@ -119,62 +118,6 @@ def _get_unique_name(name: str) -> str:
 
 
 _groups: dict[str, Callable[[], "GroupCoordinator | None"]] = {}
-
-
-def _dump_comm_enabled() -> bool:
-    return os.getenv("QWEN35_COMM_DOMAIN_DUMP", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _dump_process_group(group: "ProcessGroup", unique_name: str) -> None:
-    backend = "unknown"
-    with contextlib.suppress(Exception):
-        backend = str(torch.distributed.get_backend(group))
-    rank = None
-    world_size = None
-    with contextlib.suppress(Exception):
-        rank = torch.distributed.get_rank(group)
-    with contextlib.suppress(Exception):
-        world_size = torch.distributed.get_world_size(group)
-
-    is_npu = False
-    comm_name = None
-    with contextlib.suppress(Exception):
-        from torch_npu._C._distributed_c10d import ProcessGroupHCCL
-
-        if isinstance(group, ProcessGroupHCCL):
-            is_npu = True
-            with contextlib.suppress(Exception):
-                backend_obj = group._get_backend(torch.device("npu"))
-            with contextlib.suppress(Exception):
-                if "backend_obj" not in locals():
-                    backend_obj = getattr(group, "_backend", None)
-            if backend_obj is not None:
-                with contextlib.suppress(Exception):
-                    getter = backend_obj.get_hccl_comm_name
-                    comm_name = str(getter(0))
-
-    print(
-        f"COMM_DOMAIN_HCCL: name={unique_name}"
-        f" backend={backend}"
-        f" rank={rank}"
-        f" world_size={world_size}"
-        f" is_npu={is_npu}"
-        f" type=ProcessGroupHCCL"
-        f" get_hccl_comm_name={comm_name}",
-        flush=True,
-    )
-    print(
-        f"COMM_DOMAIN_NPU: name={unique_name}"
-        f" backend={backend}"
-        f" rank={rank}"
-        f" world_size={world_size}",
-        flush=True,
-    )
 
 
 def _register_group(group: "GroupCoordinator") -> None:
@@ -464,8 +407,6 @@ class GroupCoordinator:
             self.world_size,
             torch.distributed.get_backend(self.device_group),
         )
-        if _dump_comm_enabled():
-            _dump_process_group(self.device_group, self.unique_name)
 
     def create_mq_broadcaster(
         self, writer_rank=0, external_writer_handle=None, blocking=True
